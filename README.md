@@ -1,5 +1,5 @@
 <h1>
-  <img src="assets/logo.svg" width="40" alt="MultiMedia DL logo">
+  <img src="assets/logo.svg" width="45" alt="MultiMedia DL logo">
   MultiMedia DL
 </h1>
 
