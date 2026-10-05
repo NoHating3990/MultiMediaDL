@@ -1,6 +1,7 @@
 # MultiMedia DL
 
 A simple, self-contained multimedia downloader built with Python and yt-dlp. Distributed as an AppImage and Windows executable with all required dependencies included.
+Made for the soul purpose of relearning python and build scripts, thought someone out there would like to have it so here it is.
 
 ## Current Support
 
