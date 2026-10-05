@@ -1,21 +1,19 @@
 # MultiMedia DL
 
-A simple multimedia downloader for downloading videos and audio from various websites.
+A simple, self-contained multimedia downloader built with Python and yt-dlp. Distributed as an AppImage and Windows executable with all required dependencies included.
 
 ## Current Support
 
-* YouTube via [yt-dlp](https://github.com/yt-dlp/yt-dlp)
-
-## Planned
-
-* X / Twitter
-* TikTok
+* YouTube
 * Instagram
-* Reddit
-* More platforms in the future
+* Tiktok
+* X / Twitter
+* Soundcloud
+* Anything else supported by YT-DLP
 
 ## Status
 
-🚧 **In Development**
+**In Development**
 
 More features and platforms will be added over time.
+Your input on features would be much appreciated.
