@@ -209,6 +209,14 @@ def install_entry():
     print("Menu entry installed. Search for 'MultiMedia Downloader' in your start menu.")
 
 
+def clean_name(raw):
+    """What the user typed -> a safe file name: no folders, no extension, no yt-dlp template codes."""
+    n = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "-", (raw or "").strip())
+    n = re.sub(r"\.(mp3|mp4|mov|wav|flac|mkv|webm|m4a|opus)$", "", n, flags=re.I)
+    n = n.strip(" .")[:150]
+    return n.replace("%", "%%")  # a literal % must be doubled in yt-dlp output templates
+
+
 def explain(log, cookies_on):
     """Turn yt-dlp's raw output into one plain-English line. First match wins."""
     errs = [l for l in log if l.startswith("ERROR")]
@@ -304,6 +312,8 @@ class App(tk.Tk):
         self.dest = tk.StringVar(value=self.cfg["dest"])
         self.playlist = tk.BooleanVar(value=self.cfg["playlist"])
         self.art = tk.BooleanVar(value=self.cfg["art"])
+        self.fname = tk.StringVar(value="")  # optional output name (not saved between runs)
+        self.name_hint = tk.StringVar()
         self.vq = self.cfg["vq"] if self.cfg["vq"] in VIDEO_Q else DEFAULTS["vq"]
         self.aq = self.cfg["aq"] if self.cfg["aq"] in AUDIO_Q else DEFAULTS["aq"]
         self.qual = tk.StringVar()
@@ -368,7 +378,7 @@ class App(tk.Tk):
 
         # advanced (cookies)
         self.adv_open = False
-        self.adv_btn = ttk.Button(p, text="Advanced ▸", command=self.toggle_adv, style="Link.TButton")
+        self.adv_btn = ttk.Button(p, text="Advanced >", command=self.toggle_adv, style="Link.TButton")
         self.adv_btn.pack(anchor="w", pady=(10, 0))
         self.adv = ttk.Frame(p)
         ttk.Label(self.adv, text="Browser cookies (for videos that need a login)", style="Muted.TLabel").pack(anchor="w")
@@ -377,6 +387,13 @@ class App(tk.Tk):
         self.ccombo.bind("<<ComboboxSelected>>", self.on_cookie)
         if self.ck != "none":
             self.toggle_adv()  # make an active cookie setting visible
+
+        # optional file name, right above the Download button
+        nm = ttk.Frame(p)
+        nm.pack(fill="x", pady=(12, 0))
+        ttk.Label(nm, textvariable=self.name_hint, style="Muted.TLabel").pack(anchor="w")
+        self.name_entry = ttk.Entry(nm, textvariable=self.fname)
+        self.name_entry.pack(fill="x", pady=(3, 0))
 
         # actions + progress
         act = ttk.Frame(p)
@@ -413,7 +430,7 @@ class App(tk.Tk):
             self.adv.pack(after=self.adv_btn, anchor="w", pady=(6, 0))
         else:
             self.adv.pack_forget()
-        self.adv_btn.configure(text="Advanced ▾" if self.adv_open else "Advanced ▸")
+        self.adv_btn.configure(text="Advanced v" if self.adv_open else "Advanced >")
 
     def apply_theme(self):
         """Dark flat theme with an orange accent, built on ttk's 'clam' (no extra packages)."""
@@ -547,6 +564,10 @@ class App(tk.Tk):
     def on_change(self):
         lossless = self.type.get() == "audio" and AUDIO_FMT[self.af] != "mp3"
         self.qcombo.configure(state="disabled" if lossless else "readonly")
+        pl = self.playlist.get()
+        self.name_entry.state(["disabled"] if pl else ["!disabled"])
+        self.name_hint.set("File name (playlist items keep their own titles)" if pl
+                           else "File name (optional, blank = video title)")
         art_ok = self.type.get() == "audio" and AUDIO_FMT[self.af] in ("mp3", "flac")
         self.art_chk.state(["!disabled"] if art_ok else ["disabled"])
         self.cfg.update(art=self.art.get(), type=self.type.get(), resolve=self.res, mc=self.mc, af=self.af,
@@ -640,9 +661,12 @@ class App(tk.Tk):
     # ---- downloading ------------------------------------------------------
     def build_cmd(self, exe):
         t = self.type.get()
+        name = "" if self.playlist.get() else clean_name(self.fname.get())
         cmd = [exe, "--newline", "--no-colors", "-P", self.dest.get(),
-               "-o", "%(title)s.%(ext)s",
+               "-o", f"{name}.%(ext)s" if name else "%(title)s.%(ext)s",
                "--yes-playlist" if self.playlist.get() else "--no-playlist"]
+        if name:  # one fixed name = exactly one file, even if the link is a playlist page
+            cmd += ["--playlist-items", "1"]
         ff_dir = os.path.join(APPDIR, "usr/bin") if APPDIR else (DATA_DIR if IS_WIN else "")
         if ff_dir and os.path.exists(os.path.join(ff_dir, "ffmpeg" + EXE)):
             cmd += ["--ffmpeg-location", ff_dir]
@@ -751,7 +775,8 @@ class App(tk.Tk):
                     self.bar_mode(False)
                     if val == 0:
                         self.bar["value"] = 100
-                        self.status.set("Done ✔  → " + self.dest.get())
+                        self.status.set("Done. Saved to " + self.dest.get())
+                        self.fname.set("")  # so the next download doesn't reuse this name
                     elif self.cancelled:
                         self.status.set("Cancelled.")
                     else:
