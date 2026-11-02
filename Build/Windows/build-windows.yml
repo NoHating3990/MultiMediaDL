@@ -1,7 +1,12 @@
-# Builds MultiMedia-Downloader.exe on a free Windows machine in the cloud.
+# Builds MultiMedia Downloader for Windows on a free Windows machine in the cloud.
+# Mirrors build-appimage.sh: a self-contained app with ffmpeg + deno bundled inside,
+# encoder sanity checks, and cached downloads. yt-dlp is NOT bundled: the app downloads
+# it on first launch and keeps it fresh (same as the Linux AppImage).
+#
 # Put this file at  .github/workflows/build-windows.yml  in your GitHub repo,
 # next to ytdlp-gui.py and icon.ico, then run it from the repo's "Actions" tab.
-name: Build Windows exe
+# Output: MultiMedia-Downloader-windows.zip  (unzip anywhere, run MultiMedia-Downloader.exe)
+name: Build Windows app
 
 on:
   workflow_dispatch:        # "Run workflow" button in the Actions tab
@@ -9,11 +14,18 @@ on:
     tags: ["v*"]            # pushing a tag like v1.0 also publishes a Release
 
 permissions:
-  contents: write           # needed to attach the exe to a Release
+  contents: write           # needed to attach the zip to a Release
+
+env:
+  FFMPEG_URL: https://github.com/yt-dlp/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-win64-gpl.zip
+  DENO_URL: https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip
 
 jobs:
   build:
     runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
     steps:
       - uses: actions/checkout@v4
 
@@ -21,25 +33,74 @@ jobs:
         with:
           python-version: "3.12"   # includes Tcl/Tk
 
-      - name: Install PyInstaller
-        run: pip install pyinstaller
+      - name: "[1/6] Download dependencies (cached)"
+        uses: actions/cache@v4
+        with:
+          path: cache
+          key: tools-${{ runner.os }}-${{ hashFiles('.github/workflows/build-windows.yml') }}
 
-      - name: Build exe
-        run: >
-          pyinstaller --onefile --windowed
-          --name MultiMedia-Downloader
-          --icon icon.ico
-          --add-data "icon.ico;."
-          ytdlp-gui.py
+      - name: "[1/6] Fetch ffmpeg + deno"
+        run: |
+          New-Item -ItemType Directory -Force cache | Out-Null
+          foreach ($d in @(@("ffmpeg.zip", $env:FFMPEG_URL), @("deno.zip", $env:DENO_URL))) {
+            $dest = Join-Path cache $d[0]
+            if ((Test-Path $dest) -and (Get-Item $dest).Length -gt 0) { "  cached:      $($d[0])"; continue }
+            "  downloading: $($d[0])"
+            Invoke-WebRequest -Uri $d[1] -OutFile "$dest.part" -MaximumRetryCount 3 -RetryIntervalSec 5
+            Move-Item "$dest.part" $dest
+          }
 
-      - name: Upload exe
+      - name: "[2/6] Assemble bundle (ffmpeg, ffprobe, deno)"
+        run: |
+          Remove-Item -Recurse -Force bundle, tmp_extract -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory bundle, tmp_extract | Out-Null
+          Expand-Archive cache\ffmpeg.zip -DestinationPath tmp_extract\ffmpeg
+          Expand-Archive cache\deno.zip   -DestinationPath tmp_extract\deno
+          foreach ($f in "ffmpeg.exe", "ffprobe.exe") {
+            $src = Get-ChildItem tmp_extract\ffmpeg -Recurse -Filter $f | Select-Object -First 1
+            if (-not $src) { throw "$f not found in the ffmpeg download" }
+            Copy-Item $src.FullName bundle\
+          }
+          $deno = Get-ChildItem tmp_extract\deno -Recurse -Filter deno.exe | Select-Object -First 1
+          if (-not $deno) { throw "deno.exe not found in the deno download" }
+          Copy-Item $deno.FullName bundle\
+          Remove-Item -Recurse -Force tmp_extract
+          Get-ChildItem bundle | Format-Table Name, @{n="MB";e={[math]::Round($_.Length/1MB,1)}}
+
+      - name: "[3/6] Sanity checks"
+        run: |
+          python -c "import tkinter; print('  tkinter OK')"
+          $enc = (& bundle\ffmpeg.exe -hide_banner -encoders 2>$null) | Out-String
+          foreach ($e in "dnxhd", "libmp3lame", "libx264", "libx265", "libsvtav1", "prores_ks") {
+            if ($enc -match "\b$e\b") { "  ffmpeg: $e OK" }
+            else { Write-Host "::warning::ffmpeg lacks $e" }
+          }
+          & bundle\deno.exe --version | Select-Object -First 1
+
+      - name: "[4/6] Build app"
+        run: |
+          pip install pyinstaller
+          pyinstaller --noconfirm --clean --windowed `
+            --name MultiMedia-Downloader `
+            --icon icon.ico `
+            --add-data "icon.ico;." `
+            --add-data "bundle;tools" `
+            ytdlp-gui.py
+          if (-not (Test-Path dist\MultiMedia-Downloader\MultiMedia-Downloader.exe)) { throw "build failed" }
+
+      - name: "[5/6] Pack zip"
+        run: |
+          Compress-Archive -Path dist\MultiMedia-Downloader\* -DestinationPath MultiMedia-Downloader-windows.zip -Force
+          "  $('{0:N0}' -f ((Get-Item MultiMedia-Downloader-windows.zip).Length/1MB)) MB"
+
+      - name: "[6/6] Upload"
         uses: actions/upload-artifact@v4
         with:
           name: MultiMedia-Downloader-windows
-          path: dist/MultiMedia-Downloader.exe
+          path: MultiMedia-Downloader-windows.zip
 
       - name: Attach to Release (tags only)
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/MultiMedia-Downloader.exe
+          files: MultiMedia-Downloader-windows.zip
