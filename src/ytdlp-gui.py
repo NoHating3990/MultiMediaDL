@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """MultiMedia Downloader: a small yt-dlp GUI (Audio / MP4 / DaVinci Resolve MOV). Runs on Linux and Windows."""
-import json, os, queue, re, shlex, shutil, signal, subprocess, sys, threading, time
+import json, math, os, queue, re, shlex, shutil, signal, subprocess, sys, threading, time
 import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import ttk, filedialog, messagebox
@@ -104,10 +104,12 @@ def cookie_args(key, file):
     return []
 
 
+# Typing a name instead of a link searches one of these sites and downloads the top result.
+SEARCH_SITES = {"YouTube": "ytsearch", "SoundCloud": "scsearch"}
 DEFAULTS = {"dest": os.path.expanduser("~/Videos"), "type": "mp4",
             "resolve": list(RESOLVE)[0], "playlist": False,
             "vq": "1080p", "aq": "Best (VBR)", "af": "MP3", "mc": list(MP4_CODECS)[0],
-            "ck": "none", "cfile": "", "art": True}
+            "ck": "none", "cfile": "", "art": True, "ss": "YouTube", "mode": "link", "win": None}
 
 
 def load_cfg():
@@ -209,6 +211,17 @@ def install_entry():
     print("Menu entry installed. Search for 'MultiMedia Downloader' in your start menu.")
 
 
+def is_link(text):
+    """True for anything that looks like a URL; otherwise the text is treated as a search."""
+    t = text.strip()
+    if "://" in t or re.match(r"^\w+search\d*:", t):  # full URL, or a yt-dlp search prefix typed by hand
+        return True
+    return " " not in t and bool(re.match(r"^(www\.)?[a-z0-9-]+(\.[a-z0-9-]+)*\.[a-z]{2,10}(/|\?|$)", t, re.I))
+
+
+SPOTIFY_SONG = re.compile(r"open\.spotify\.com/(?:intl-\w+/)?(?:track|album|playlist|artist)/", re.I)
+
+
 def clean_name(raw):
     """What the user typed -> a safe file name: no folders, no extension, no yt-dlp template codes."""
     n = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "-", (raw or "").strip())
@@ -232,7 +245,7 @@ def explain(log, cookies_on):
     if has("not a bot", "sign in to confirm", "login required", "log in", "sign in", "members-only", "join this channel"):
         if cookies_on:
             return "The site still wants a login. Make sure you're signed in in that browser, or try another browser/cookies.txt."
-        return "The site wants a login. Pick your browser (or a cookies.txt file) under Cookies and try again."
+        return "The site wants a login. Open Settings (the gear icon), pick your browser (or a cookies.txt file) under Browser cookies, and try again."
     if has("live event will begin", "premieres in", "this live event"):
         return "This is an upcoming livestream or premiere. It isn't available yet."
     if has("drm"):
@@ -246,7 +259,7 @@ def explain(log, cookies_on):
     if has("http error 429", "too many requests"):
         return "The site is rate-limiting you. Wait a few minutes and try again."
     if has("http error 403", "forbidden", "signature", "n challenge", "nsig", "javascript runtime"):
-        return "The site blocked the download. Click 'Update yt-dlp' and try again."
+        return "The site blocked the download. Open Settings (the gear icon), click 'Update yt-dlp', and try again."
     if has("unsupported url"):
         return "That link isn't supported. Check the URL."
     if has("name resolution", "unable to download webpage", "timed out", "network is unreachable",
@@ -255,21 +268,21 @@ def explain(log, cookies_on):
     if has("no space left"):
         return "The disk is full. Free some space or pick another folder."
     if has("permission denied", "read-only file system"):
-        return "Can't write to that folder. Pick a different one with Browse."
+        return "Can't write to that folder. Change the save location in Settings (the gear icon)."
     if has("ffmpeg", "ffprobe") and has("not found", "not installed"):
         return "ffmpeg wasn't found, so the file couldn't be converted."
     if has("conversion failed", "unknown encoder", "error initializing", "invalid argument", "postprocessing"):
-        return "Converting the file failed. Try a different codec (see Show log)."
+        return "Converting the file failed. Try a different codec (see Show log in Settings)."
     if errs:
         msg = re.sub(r"^ERROR:\s*(?:\[[^\]]*\]\s*[\w\-]+:\s*)?", "", errs[-1])
-        return f"Failed: {msg[:100]} (see Show log)"
-    return "Failed. Click 'Show log' for details."
+        return f"Failed: {msg[:100]} (see Show log in Settings)"
+    return "Failed. Open Settings and click 'Show log' for details."
 
 
 # Status text per yt-dlp stage. busy=True -> no percentage exists, so the bar just animates.
 STAGES = (
     ("[youtube", "Fetching video info…", False), ("[info]", "Fetching video info…", False),
-    ("[generic]", "Fetching video info…", False),
+    ("[generic]", "Fetching video info…", False), ("[soundcloud", "Fetching track info…", False),
     ("[Merger]", "Merging video and audio…", True),
     ("[VideoConvertor]", "Converting video… this can take a while", True),
     ("[ExtractAudio]", "Converting audio…", True),
@@ -283,7 +296,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("MultiMedia Downloader")
-        self.resizable(False, False)
+        self.resizable(True, True)
         if IS_WIN:  # icon.ico is bundled into the exe by PyInstaller
             try:
                 base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
@@ -297,6 +310,9 @@ class App(tk.Tk):
         self.indet = False
         self.log = []
         self.logwin = self.logtext = None
+        self.setwin = self.ccombo = None
+        self._rs = None
+        self.cur_size = FONT_SIZE
         self.q = queue.Queue()
 
         self.url = tk.StringVar()
@@ -314,12 +330,17 @@ class App(tk.Tk):
         self.art = tk.BooleanVar(value=self.cfg["art"])
         self.fname = tk.StringVar(value="")  # optional output name (not saved between runs)
         self.name_hint = tk.StringVar()
+        self.ss = tk.StringVar(value=self.cfg["ss"] if self.cfg["ss"] in SEARCH_SITES else DEFAULTS["ss"])
+        self.search_hint = tk.StringVar()
+        self.mode = tk.StringVar(value=self.cfg["mode"] if self.cfg["mode"] in ("link", "search") else "link")
+        self.cur_mode = self.mode.get()
+        self.texts = {"link": "", "search": ""}  # each tab remembers what you typed in it
         self.vq = self.cfg["vq"] if self.cfg["vq"] in VIDEO_Q else DEFAULTS["vq"]
         self.aq = self.cfg["aq"] if self.cfg["aq"] in AUDIO_Q else DEFAULTS["aq"]
         self.qual = tk.StringVar()
         self.status = tk.StringVar(value="Ready")
         self.apply_theme()
-        title_font = tkfont.nametofont("TkDefaultFont").copy()
+        title_font = self.title_font = tkfont.nametofont("TkDefaultFont").copy()
         title_font.configure(size=FONT_SIZE + 9, weight="bold")
 
         p = ttk.Frame(self, padding=(22, 18))
@@ -329,14 +350,27 @@ class App(tk.Tk):
         head = ttk.Frame(p)
         head.pack(fill="x")
         ttk.Label(head, text="MultiMedia Downloader", font=title_font, style="Title.TLabel").pack(side="left")
+        self.gear = self.make_gear(head)
+        self.gear.pack(side="right")
 
-        # link + paste
+        # Link / Search tabs, attached to the input bar below
+        tabs = ttk.Frame(p)
+        tabs.pack(fill="x", pady=(14, 0))
+        for text, val in (("Link", "link"), ("Search", "search")):
+            ttk.Radiobutton(tabs, text=text, value=val, variable=self.mode, command=self.on_mode,
+                            style="Tab.Toolbutton").pack(side="left", padx=(0, 4))
+
         row = ttk.Frame(p)
-        row.pack(fill="x", pady=(14, 0))
-        e = ttk.Entry(row, textvariable=self.url, width=48)
-        e.pack(side="left", fill="x", expand=True)
-        e.focus()
-        ttk.Button(row, text="Paste", command=self.paste).pack(side="left", padx=(8, 0))
+        row.pack(fill="x")
+        self.entry = ttk.Entry(row, textvariable=self.url, width=30)
+        self.entry.pack(side="left", fill="x", expand=True)
+        self.entry.focus()
+        self.site_combo = ttk.Combobox(row, textvariable=self.ss, values=list(SEARCH_SITES),
+                                       state="readonly", width=11)  # only shown on the Search tab
+        self.site_combo.bind("<<ComboboxSelected>>", lambda _: self.on_change())
+        self.paste_btn = ttk.Button(row, text="Paste", command=self.paste)
+        self.paste_btn.pack(side="left", padx=(8, 0))
+        ttk.Label(p, textvariable=self.search_hint, style="Muted.TLabel").pack(anchor="w", pady=(5, 0))
 
         # output type
         fmt = ttk.Frame(p)
@@ -358,15 +392,6 @@ class App(tk.Tk):
         self.combo.grid(row=1, column=1, sticky="ew", pady=(3, 0), padx=(12, 0))
         self.combo.bind("<<ComboboxSelected>>", self.on_codec)
 
-        # save location
-        sv = ttk.Frame(p)
-        sv.pack(fill="x", pady=(14, 0))
-        ttk.Label(sv, text="Save to", style="Muted.TLabel").pack(anchor="w")
-        r2 = ttk.Frame(sv)
-        r2.pack(fill="x", pady=(3, 0))
-        ttk.Entry(r2, textvariable=self.dest, state="readonly").pack(side="left", fill="x", expand=True)
-        ttk.Button(r2, text="Browse…", command=self.browse).pack(side="left", padx=(8, 0))
-
         # toggles
         tg = ttk.Frame(p)
         tg.pack(fill="x", pady=(12, 0))
@@ -375,18 +400,6 @@ class App(tk.Tk):
         self.art_chk = ttk.Checkbutton(tg, text="Embed cover art & tags", variable=self.art,
                                        command=self.on_change)
         self.art_chk.pack(side="left", padx=(18, 0))
-
-        # advanced (cookies)
-        self.adv_open = False
-        self.adv_btn = ttk.Button(p, text="Advanced >", command=self.toggle_adv, style="Link.TButton")
-        self.adv_btn.pack(anchor="w", pady=(10, 0))
-        self.adv = ttk.Frame(p)
-        ttk.Label(self.adv, text="Browser cookies (for videos that need a login)", style="Muted.TLabel").pack(anchor="w")
-        self.ccombo = ttk.Combobox(self.adv, textvariable=self.cookie, state="readonly", width=34)
-        self.ccombo.pack(anchor="w", pady=(3, 0))
-        self.ccombo.bind("<<ComboboxSelected>>", self.on_cookie)
-        if self.ck != "none":
-            self.toggle_adv()  # make an active cookie setting visible
 
         # optional file name, right above the Download button
         nm = ttk.Frame(p)
@@ -405,32 +418,148 @@ class App(tk.Tk):
 
         self.bar = ttk.Progressbar(p, maximum=100)
         self.bar.pack(fill="x", pady=(14, 0))
-        ttk.Label(p, textvariable=self.status, wraplength=540, justify="left",
-                  anchor="w").pack(fill="x", pady=(6, 0))
+        self.status_lbl = ttk.Label(p, textvariable=self.status, wraplength=540, justify="left", anchor="w")
+        self.status_lbl.pack(fill="x", pady=(6, 0))
 
         # footer
         foot = ttk.Frame(p)
         foot.pack(fill="x", pady=(10, 0))
         ttk.Button(foot, text="Open folder", command=self.open_folder).pack(side="left")
-        ttk.Button(foot, text="Show log", command=self.show_log).pack(side="left", padx=6)
-        ttk.Button(foot, text="Update yt-dlp", command=self.update_ytdlp).pack(side="right")
 
         self.bind("<Return>", lambda _: self.start())
         self.protocol("WM_DELETE_WINDOW", self.close)
         self.refresh_quality()
         self.refresh_codec()
-        self.refresh_cookies()
+        self.apply_mode()
         self.on_change()
         self.after(100, self.poll)
         self.after(300, self.ensure_ytdlp)
 
-    def toggle_adv(self):
-        self.adv_open = not self.adv_open
-        if self.adv_open:
-            self.adv.pack(after=self.adv_btn, anchor="w", pady=(6, 0))
+        # resizable: remember the natural size as the 100% baseline; text scales with the window
+        self.update_idletasks()
+        self.base = (self.winfo_reqwidth(), self.winfo_reqheight())
+        self.minsize(int(self.base[0] * 0.8), int(self.base[1] * 0.8))
+        w, h = self.base
+        saved = self.cfg.get("win")
+        if isinstance(saved, (list, tuple)) and len(saved) == 2:
+            try:  # restore last size, but never bigger than the screen
+                w = min(max(int(saved[0]), int(self.base[0] * 0.8)), self.winfo_screenwidth())
+                h = min(max(int(saved[1]), int(self.base[1] * 0.8)), self.winfo_screenheight())
+            except (TypeError, ValueError):
+                pass
+        self.geometry(f"{w}x{h}")
+        self.bind("<Configure>", self.on_resize)
+        self.after(50, self.apply_scale)
+
+    def on_resize(self, e):
+        if e.widget is not self:
+            return
+        if self._rs:
+            self.after_cancel(self._rs)
+        self._rs = self.after(60, self.apply_scale)
+
+    def apply_scale(self):
+        """Grow/shrink every font in step with the window so the whole UI scales."""
+        self._rs = None
+        w, h = self.winfo_width(), self.winfo_height()
+        if w < 50 or h < 50:
+            return
+        self.status_lbl.configure(wraplength=max(200, w - 50))
+        s = max(0.8, min(2.5, min(w / self.base[0], h / self.base[1])))
+        size = round(FONT_SIZE * s)
+        if size == self.cur_size:
+            return
+        self.cur_size = size
+        for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont", "TkCaptionFont"):
+            tkfont.nametofont(name).configure(size=size)
+        tkfont.nametofont("TkTooltipFont").configure(size=max(6, size - 1))
+        tkfont.nametofont("TkFixedFont").configure(size=max(6, size - 1))
+        self.title_font.configure(size=round((FONT_SIZE + 9) * s))
+
+    def on_mode(self):
+        self.texts[self.cur_mode] = self.url.get()
+        self.cur_mode = self.mode.get()
+        self.url.set(self.texts[self.cur_mode])
+        self.apply_mode()
+        self.on_change()
+
+    def apply_mode(self):
+        if self.mode.get() == "search":
+            self.site_combo.pack(side="left", padx=(8, 0), before=self.paste_btn)
+            self.search_hint.set("Type a song or video name. The top result is downloaded.")
         else:
-            self.adv.pack_forget()
-        self.adv_btn.configure(text="Advanced v" if self.adv_open else "Advanced >")
+            self.site_combo.pack_forget()
+            self.search_hint.set("Paste a link from YouTube, TikTok, Instagram, X, SoundCloud and more.")
+        self.entry.focus()
+
+    # ---- settings (gear) --------------------------------------------------
+    def make_gear(self, parent, size=30):
+        """A small gear drawn on a canvas so it looks the same on every system/font."""
+        c = tk.Canvas(parent, width=size, height=size, bg=BG, highlightthickness=0, cursor="hand2")
+        cx = cy = size / 2
+        ro, ri, teeth = size * 0.46, size * 0.34, 8
+        pts = []
+        for i in range(teeth):
+            a0 = 2 * math.pi * i / teeth
+            step = 2 * math.pi / teeth
+            for frac, r in ((-0.22, ri), (-0.12, ro), (0.12, ro), (0.22, ri)):
+                a = a0 + frac * step * 2
+                pts += [cx + r * math.cos(a), cy + r * math.sin(a)]
+        body = c.create_polygon(pts, fill=MUTED, outline=MUTED, width=1)
+        hole = size * 0.14
+        c.create_oval(cx - hole, cy - hole, cx + hole, cy + hole, fill=BG, outline=BG)
+        c.bind("<Enter>", lambda _: c.itemconfigure(body, fill=ACCENT, outline=ACCENT))
+        c.bind("<Leave>", lambda _: c.itemconfigure(body, fill=MUTED, outline=MUTED))
+        c.bind("<Button-1>", lambda _: self.open_settings())
+        return c
+
+    def open_settings(self):
+        if self.setwin and self.setwin.winfo_exists():
+            self.setwin.lift()
+            self.setwin.focus_set()
+            return
+        w = tk.Toplevel(self, bg=BG)
+        w.title("Settings")
+        w.resizable(False, False)
+        w.transient(self)
+        self.setwin = w
+        p = ttk.Frame(w, padding=(22, 18))
+        p.pack(fill="both", expand=True)
+        ttk.Label(p, text="Settings", font=tkfont.nametofont("TkDefaultFont").copy(), style="Title.TLabel").pack(anchor="w")
+
+        ttk.Label(p, text="Browser cookies (for videos that need a login)", style="Muted.TLabel").pack(anchor="w", pady=(14, 0))
+        self.ccombo = ttk.Combobox(p, textvariable=self.cookie, state="readonly", width=38)
+        self.ccombo.pack(fill="x", pady=(3, 0))
+        self.ccombo.bind("<<ComboboxSelected>>", self.on_cookie)
+        self.refresh_cookies()
+
+        ttk.Label(p, text="Default save location", style="Muted.TLabel").pack(anchor="w", pady=(14, 0))
+        r = ttk.Frame(p)
+        r.pack(fill="x", pady=(3, 0))
+        ttk.Entry(r, textvariable=self.dest, state="readonly").pack(side="left", fill="x", expand=True)
+        ttk.Button(r, text="Browse…", command=self.browse).pack(side="left", padx=(8, 0))
+
+        b = ttk.Frame(p)
+        b.pack(fill="x", pady=(18, 0))
+        b.columnconfigure((0, 1), weight=1, uniform="b")
+        ttk.Button(b, text="Show log", command=lambda: (self.close_settings(), self.show_log())
+                   ).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        ttk.Button(b, text="Update yt-dlp", command=lambda: (self.close_settings(), self.update_ytdlp())
+                   ).grid(row=0, column=1, sticky="ew", padx=(4, 0))
+        ttk.Button(p, text="Close", command=self.close_settings, style="Accent.TButton").pack(fill="x", pady=(10, 0))
+
+        w.bind("<Escape>", lambda _: self.close_settings())
+        w.protocol("WM_DELETE_WINDOW", self.close_settings)
+        w.update_idletasks()  # centre over the main window
+        x = self.winfo_rootx() + (self.winfo_width() - w.winfo_reqwidth()) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - w.winfo_reqheight()) // 2
+        w.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        w.focus_set()
+
+    def close_settings(self):
+        if self.setwin and self.setwin.winfo_exists():
+            self.setwin.destroy()
+        self.setwin = self.ccombo = None
 
     def apply_theme(self):
         """Dark flat theme with an orange accent, built on ttk's 'clam' (no extra packages)."""
@@ -471,6 +600,13 @@ class App(tk.Tk):
         st.configure("Toolbutton", background=BTN, foreground=FG, padding=(10, 8), relief="flat", **flat)
         st.map("Toolbutton", background=[("selected", ACCENT), ("active", BTN_HOVER)],
                foreground=[("selected", "#000000")], relief=[("selected", "flat"), ("pressed", "flat")])
+
+        # Link / Search tabs: the selected tab shares the input bar's colour so it looks attached to it
+        st.configure("Tab.Toolbutton", background=BG, foreground=MUTED, padding=(20, 8), relief="flat",
+                     lightcolor=BG, darkcolor=BG, bordercolor=BG, focuscolor=BG)
+        st.map("Tab.Toolbutton", background=[("selected", FIELD), ("active", BTN)],
+               foreground=[("selected", ACCENT), ("active", FG)], relief=[("selected", "flat"), ("pressed", "flat")],
+               bordercolor=[("selected", FIELD)], lightcolor=[("selected", FIELD)], darkcolor=[("selected", FIELD)])
 
         for w in ("TEntry", "TCombobox"):
             st.configure(w, fieldbackground=FIELD, foreground=FG, padding=7, arrowcolor=FG,
@@ -570,7 +706,7 @@ class App(tk.Tk):
                            else "File name (optional, blank = video title)")
         art_ok = self.type.get() == "audio" and AUDIO_FMT[self.af] in ("mp3", "flac")
         self.art_chk.state(["!disabled"] if art_ok else ["disabled"])
-        self.cfg.update(art=self.art.get(), type=self.type.get(), resolve=self.res, mc=self.mc, af=self.af,
+        self.cfg.update(art=self.art.get(), ss=self.ss.get(), mode=self.mode.get(), type=self.type.get(), resolve=self.res, mc=self.mc, af=self.af,
                         dest=self.dest.get(), playlist=self.playlist.get(),
                         vq=self.vq, aq=self.aq, ck=self.ck, cfile=self.cfile)
         save_cfg(self.cfg)
@@ -585,13 +721,14 @@ class App(tk.Tk):
 
     def refresh_cookies(self):
         opts = self.cookie_options()
-        self.ccombo.configure(values=[l for l, _ in opts])
+        if self.ccombo and self.ccombo.winfo_exists():
+            self.ccombo.configure(values=[l for l, _ in opts])
         self.cookie.set(next((l for l, k in opts if k == self.ck), "None"))
 
     def on_cookie(self, _=None):
         key = dict(self.cookie_options()).get(self.cookie.get(), "none")
         if key == "file":
-            f = filedialog.askopenfilename(title="Select a cookies.txt file",
+            f = filedialog.askopenfilename(parent=self.setwin or self, title="Select a cookies.txt file",
                                            initialdir=os.path.dirname(self.cfile) if self.cfile else os.path.expanduser("~"),
                                            filetypes=[("cookies.txt", "*.txt"), ("All files", "*")])
             if f:
@@ -603,7 +740,7 @@ class App(tk.Tk):
 
     # ---- small helpers ----------------------------------------------------
     def browse(self):
-        d = filedialog.askdirectory(initialdir=self.dest.get(), title="Choose download folder")
+        d = filedialog.askdirectory(parent=self.setwin or self, initialdir=self.dest.get(), title="Choose download folder")
         if d:
             self.dest.set(d)
             self.on_change()
@@ -659,6 +796,14 @@ class App(tk.Tk):
         self.logwin, self.logtext = w, t
 
     # ---- downloading ------------------------------------------------------
+    def is_search(self):
+        """On the Search tab, anything that isn't a full link is looked up by name."""
+        return self.mode.get() == "search" and "://" not in self.url.get()
+
+    def target(self):
+        text = self.url.get().strip()
+        return f"{SEARCH_SITES[self.ss.get()]}1:{text}" if self.is_search() else text
+
     def build_cmd(self, exe):
         t = self.type.get()
         name = "" if self.playlist.get() else clean_name(self.fname.get())
@@ -678,7 +823,7 @@ class App(tk.Tk):
                 cmd += ["--audio-quality", AUDIO_Q[self.aq]]
             if self.art.get() and fmt in ("mp3", "flac"):
                 cmd += ["--embed-thumbnail", "--embed-metadata", "--convert-thumbnails", "jpg"]
-            return cmd + [self.url.get().strip()]
+            return cmd + [self.target()]
         cmd += ["-f", "bv*+ba/b"]
         h = VIDEO_Q[self.vq]
         if h:  # prefer the best stream at or below this height (falls back to closest if none)
@@ -693,18 +838,25 @@ class App(tk.Tk):
         else:
             cmd += ["--recode-video", "mov",
                     "--postprocessor-args", "VideoConvertor:" + RESOLVE[self.res]]
-        return cmd + [self.url.get().strip()]
+        return cmd + [self.target()]
 
     def start(self):
         if self.proc or self.locked or not self.url.get().strip():
             return
+        if self.mode.get() == "link" and not is_link(self.url.get()):
+            self.status.set("That doesn't look like a link. Use the Search tab to look something up by name.")
+            return
+        if SPOTIFY_SONG.search(self.url.get()):
+            self.status.set("Spotify songs are copy-protected, so links can't be downloaded. "
+                            "Type the artist and song name instead.")
+            return
         exe = find_ytdlp()
         if not exe:
             messagebox.showerror("yt-dlp not found",
-                                 "Couldn't download yt-dlp. Check your internet connection, then click 'Update yt-dlp'.")
+                                 "Couldn't download yt-dlp. Check your internet connection, then open Settings and click 'Update yt-dlp'.")
             return
         if self.ck == "file" and not os.path.isfile(self.cfile):
-            messagebox.showerror("cookies.txt missing", "The selected cookies.txt file no longer exists. Pick it again under Cookies.")
+            messagebox.showerror("cookies.txt missing", "The selected cookies.txt file no longer exists. Pick it again in Settings.")
             return
         os.makedirs(self.dest.get(), exist_ok=True)
         cmd = self.build_cmd(exe)
@@ -717,7 +869,7 @@ class App(tk.Tk):
         self.add_log("$ " + " ".join(shlex.quote(c) for c in cmd))
         self.bar_mode(False)
         self.bar["value"] = 0
-        self.status.set("Starting…")
+        self.status.set(f"Searching {self.ss.get()} for the top result…" if self.is_search() else "Starting…")
         self.go.state(["disabled"])
         self.stop.state(["!disabled"])
         threading.Thread(target=self.run, args=(cmd,), daemon=True).start()
@@ -848,6 +1000,7 @@ class App(tk.Tk):
 
     def close(self):
         self.cancel()
+        self.cfg["win"] = [self.winfo_width(), self.winfo_height()]
         self.on_change()
         self.destroy()
 
