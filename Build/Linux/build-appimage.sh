@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Builds a self-contained MultiMedia Downloader AppImage.
-# Put this script and ytdlp-gui.py in /home/hate/Downloads/YTDownloader/, then run:  bash build-appimage.sh
+# Put this script and ytdlp-gui.py in the same folder (anywhere), then run:  bash build-appimage.sh
+# Everything (cache, AppDir, the finished AppImage) is created inside that folder.
+# To build somewhere else instead:  BUILD_DIR=/some/path bash build-appimage.sh
 # yt-dlp is NOT bundled: the app downloads it on first launch and keeps it fresh.
 # Python: conda-forge's build (via micromamba). Neither it nor python-build-standalone ships a Tk with
 # Xft (anti-aliased fonts), so we compile Tcl/Tk with --enable-xft inside an Ubuntu 22.04 container
@@ -9,8 +11,8 @@
 # Needs: internet, curl, tar (with xz). Downloads are cached in ./cache so re-runs are fast.
 set -euo pipefail
 
-BUILD="${BUILD_DIR:-/home/hate/Downloads/YTDownloader}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BUILD="${BUILD_DIR:-$HERE}"
 CACHE="$BUILD/cache"
 APPDIR="$BUILD/AppDir"
 OUT="$BUILD/MultiMedia-Downloader-x86_64.AppImage"
@@ -20,7 +22,7 @@ SRC=""
 for d in "$HERE" "$BUILD"; do
   if [ -f "$d/ytdlp-gui.py" ]; then SRC="$d/ytdlp-gui.py"; break; fi
 done
-[ -n "$SRC" ] || { echo "ERROR: ytdlp-gui.py not found next to this script or in $BUILD"; exit 1; }
+[ -n "$SRC" ] || { echo "ERROR: ytdlp-gui.py not found next to this script ($HERE) or in $BUILD"; exit 1; }
 
 dl() { # dl URL DEST
   if [ -s "$2" ]; then echo "  cached:      $(basename "$2")"; return 0; fi
